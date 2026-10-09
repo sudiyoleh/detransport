@@ -1,7 +1,7 @@
 import logging
 import math
 import os
-from config import BOT_TOKEN
+#from config import BOT_TOKEN
 
 import aiohttp
 from telegram import (

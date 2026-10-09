@@ -471,8 +471,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
 def main():
-   #TOKEN = os.getenv("BOT_TOKEN")
-    TOKEN = BOT_TOKEN
+   TOKEN = os.getenv("BOT_TOKEN")
+   #TOKEN = BOT_TOKEN
 
     app = ApplicationBuilder().token(TOKEN).build()
 

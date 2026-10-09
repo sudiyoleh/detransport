@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+from config import BOT_TOKEN
 
 import aiohttp
 from telegram import (
@@ -159,11 +160,22 @@ async def build_stop_response(user_id, stop_id, stop_name, extra_dist_text="", s
                     v.get('name') or v.get('number') or v.get('route') or v.get('route_name') or v.get('title') or '?')
                 time_min = round(v.get('time', 0) / 60)
 
-                # Визначаємо тип транспорту (поле 'type')
                 v_type = v.get('type')
                 t_name, t_emoji = get_transport_type_info(v_type)
 
-                response_text += f" • {t_emoji} {t_name} {route}: через {time_min} хв\n"
+                # Формуємо базовий рядок для першого прибуття
+                line = f" • {t_emoji} {t_name} {route}: через {time_min} хв"
+
+                # Додаємо час наступного рейсу (timenext), якщо він наявний в API
+                timenext = v.get('timenext')
+                if timenext is not None:
+                    try:
+                        timenext_min = round(int(timenext) / 60)
+                        line += f" (-> {timenext_min} хв)"
+                    except (ValueError, TypeError):
+                        pass
+
+                response_text += line + "\n"
         else:
             if show_only_fav_routes:
                 response_text += "⚠️ У вас немає улюблених маршрутів на цій зупинці або вони зараз не їдуть.\n"
@@ -172,24 +184,26 @@ async def build_stop_response(user_id, stop_id, stop_name, extra_dist_text="", s
     else:
         response_text += " • Немає даних про транспорт\n"
 
-    # Дві головні кнопки під зупинкою:
     favs = user_favorites.get(user_id, [])
     is_favorite_stop = any(f['id'] == stop_id for f in favs)
 
     if is_favorite_stop:
         stop_btn = InlineKeyboardButton("🗑 Видалити зупинку з улюблених", callback_data=f"fav_del_{stop_id}")
     else:
-        stop_btn = InlineKeyboardButton("⭐ Додати в улюблені", callback_data=f"fav_add_{stop_id}_{stop_name}")
+        stop_btn = InlineKeyboardButton("⭐ Додати в улюблені", callback_data=f"fav_add_{stop_id}")
 
-    bus_btn = InlineKeyboardButton("🚌 Додати автобус в улюблені", callback_data=f"menu_buses_{stop_id}_{stop_name}")
+    bus_btn = InlineKeyboardButton("🚌 Додати автобус в улюблені", callback_data=f"menu_buses_{stop_id}")
+
+    refresh_flag = "1" if show_only_fav_routes else "0"
+    refresh_btn = InlineKeyboardButton("🔄 Оновити", callback_data=f"refresh_stop_{stop_id}_{refresh_flag}")
 
     keyboard = InlineKeyboardMarkup([
+        [refresh_btn],
         [stop_btn],
         [bus_btn]
     ])
 
     return response_text, keyboard
-
 
 # --- Логіка Telegram-бота ---
 
@@ -231,7 +245,12 @@ async def handle_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
         stop_name = s.get('name')
 
         text, kb = await build_stop_response(user_id, stop_id, stop_name)
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        try:
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        except Exception as e:
+            # Якщо виникне помилка парсингу Markdown через спецсимволи, надсилаємо без форматування
+            logger.error(f"Помилка відправки повідомлення зупинки: {e}")
+            await update.message.reply_text(text, reply_markup=kb)
 
     return ConversationHandler.END
 
@@ -291,10 +310,34 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = query.from_user.id
 
-    if data.startswith("fav_add_"):
-        parts = data.split("_", 3)
-        stop_id = parts[2]
-        stop_name = parts[3]
+    if data.startswith("refresh_stop_"):
+        rest = data.removeprefix("refresh_stop_")
+        stop_id, flag = rest.rsplit("_", 1)
+        show_favs_flag = (flag == "1")
+
+        stops = await get_all_stops()
+        stop_name = "Зупинка"
+        for s in stops:
+            if str(s.get('id')) == stop_id:
+                stop_name = s.get('name', 'Зупинка')
+                break
+
+        text, kb = await build_stop_response(user_id, stop_id, stop_name, show_only_fav_routes=show_favs_flag)
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+        await query.answer("Дані оновлено!", show_alert=False)
+
+    elif data.startswith("fav_add_"):
+        stop_id = data.removeprefix("fav_add_")
+
+        stops = await get_all_stops()
+        stop_name = "Зупинка"
+        for s in stops:
+            if str(s.get('id')) == stop_id:
+                stop_name = s.get('name', 'Зупинка')
+                break
 
         if user_id not in user_favorites:
             user_favorites[user_id] = []
@@ -310,7 +353,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Ця зупинка вже є в улюблених!", show_alert=True)
 
     elif data.startswith("fav_del_"):
-        stop_id = data.split("_", 2)[2]
+        stop_id = data.removeprefix("fav_del_")
 
         if user_id in user_favorites:
             user_favorites[user_id] = [f for f in user_favorites[user_id] if f['id'] != stop_id]
@@ -322,9 +365,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                        reply_markup=get_main_keyboard())
 
     elif data.startswith("menu_buses_"):
-        parts = data.split("_", 3)
-        stop_id = parts[2]
-        stop_name = parts[3]
+        stop_id = data.removeprefix("menu_buses_")
+
+        stops = await get_all_stops()
+        stop_name = "Зупинка"
+        for s in stops:
+            if str(s.get('id')) == stop_id:
+                stop_name = s.get('name', 'Зупинка')
+                break
 
         vehicles = await get_vehicles_for_stop(stop_id)
         user_fav_routes = user_favorite_routes.get(user_id, {}).get(stop_id, [])
@@ -333,7 +381,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Наразі немає даних про маршрути на цій зупинці.", show_alert=True)
             return
 
-        # Збираємо унікальні номери маршрутів разом із їхнім типом для відображення в меню
         unique_routes = {}
         for v in vehicles:
             r = str(v.get('name') or v.get('number') or v.get('route') or v.get('route_name') or v.get('title') or '?')
@@ -345,10 +392,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_fav = r in user_fav_routes
             icon = "✅" if is_fav else "➕"
             btn_text = f"{icon} {t_emoji} {t_name} {r}"
-            bus_keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"toggle_bus_{stop_id}_{r}_{stop_name}")])
+            bus_keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"toggle_bus_{stop_id}_{r}")])
 
         bus_keyboard.append(
-            [InlineKeyboardButton("⬅️ Назад до зупинки", callback_data=f"back_to_stop_{stop_id}_{stop_name}")])
+            [InlineKeyboardButton("⬅️ Назад до зупинки", callback_data=f"back_to_stop_{stop_id}")])
 
         await query.edit_message_text(
             f"🚌 **Керування улюбленими маршрутами** для зупинки:\n🚏 *{stop_name}*\n\nНатисніть на маршрут, щоб додати/видалити з улюблених:",
@@ -357,12 +404,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("toggle_bus_"):
-        parts = data.split("_", 3)
-        stop_id = parts[2]
-        rest = parts[3]
-        last_underscore_idx = rest.rfind("_")
-        route_num = rest[:last_underscore_idx]
-        stop_name = rest[last_underscore_idx + 1:]
+        rest = data.removeprefix("toggle_bus_")
+        stop_id, route_num = rest.split("_", 1)
 
         if user_id not in user_favorite_routes:
             user_favorite_routes[user_id] = {}
@@ -374,6 +417,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fav_routes.remove(route_num)
         else:
             fav_routes.append(route_num)
+
+        stops = await get_all_stops()
+        stop_name = "Зупинка"
+        for s in stops:
+            if str(s.get('id')) == stop_id:
+                stop_name = s.get('name', 'Зупинка')
+                break
 
         vehicles = await get_vehicles_for_stop(stop_id)
         unique_routes = {}
@@ -387,10 +437,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_fav = r in user_favorite_routes[user_id][stop_id]
             icon = "✅" if is_fav else "➕"
             btn_text = f"{icon} {t_emoji} {t_name} {r}"
-            bus_keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"toggle_bus_{stop_id}_{r}_{stop_name}")])
+            bus_keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"toggle_bus_{stop_id}_{r}")])
 
         bus_keyboard.append(
-            [InlineKeyboardButton("⬅️ Назад до зупинки", callback_data=f"back_to_stop_{stop_id}_{stop_name}")])
+            [InlineKeyboardButton("⬅️ Назад до зупинки", callback_data=f"back_to_stop_{stop_id}")])
 
         await query.edit_message_text(
             f"🚌 **Керування улюбленими маршрутами** для зупинки:\n🚏 *{stop_name}*\n\nНатисніть на маршрут, щоб додати/видалити з улюблених:",
@@ -399,15 +449,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data.startswith("back_to_stop_"):
-        parts = data.split("_", 3)
-        stop_id = parts[2]
-        stop_name = parts[3]
+        stop_id = data.removeprefix("back_to_stop_")
+
+        stops = await get_all_stops()
+        stop_name = "Зупинка"
+        for s in stops:
+            if str(s.get('id')) == stop_id:
+                stop_name = s.get('name', 'Зупинка')
+                break
 
         text, kb = await build_stop_response(user_id, stop_id, stop_name)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
 
     elif data.startswith("fav_show_"):
-        stop_id = data.split("_")[2]
+        stop_id = data.removeprefix("fav_show_")
 
         favs = user_favorites.get(user_id, [])
         stop_name = next((f['name'] for f in favs if f['id'] == stop_id), "Зупинка")
@@ -415,9 +470,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, kb = await build_stop_response(user_id, stop_id, stop_name, show_only_fav_routes=True)
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
-
 def main():
-    TOKEN = os.getenv("BOT_TOKEN")
+   #TOKEN = os.getenv("BOT_TOKEN")
+    TOKEN = BOT_TOKEN
 
     app = ApplicationBuilder().token(TOKEN).build()
 
